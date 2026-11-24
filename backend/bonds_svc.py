@@ -10,6 +10,26 @@ from models import BondOpenIn, DepositIn
 
 router = APIRouter(tags=["bonds"])
 
+LIVE_STATUSES = "('已冻结','核验通过','核验违约','部分解笼','部分罚没')"
+
+
+def _live_frozen(conn, party_key: str) -> float:
+    return float(
+        conn.execute(
+            f"""SELECT COALESCE(SUM(available),0) s FROM cages
+                WHERE party_key=? AND status IN {LIVE_STATUSES}""",
+            (party_key,),
+        ).fetchone()["s"]
+    )
+
+
+def _account_view(conn, row) -> dict:
+    item = dict(row)
+    live = _live_frozen(conn, item["party_key"])
+    item["live_cage_available"] = live
+    item["frozen_consistent"] = abs(float(item["frozen"]) - live) < 1e-6
+    return item
+
 
 @router.get("/api/bonds")
 def list_bonds(authorization: AuthHeader = None):
@@ -18,7 +38,7 @@ def list_bonds(authorization: AuthHeader = None):
         rows = conn.execute(
             """SELECT * FROM bond_accounts ORDER BY id"""
         ).fetchall()
-        return {"items": [dict(r) for r in rows]}
+        return {"items": [_account_view(conn, r) for r in rows]}
 
 
 @router.get("/api/bonds/{party_key}")
@@ -40,7 +60,7 @@ def get_bond(party_key: str, authorization: AuthHeader = None):
             (party_key,),
         ).fetchall()
         return {
-            "account": dict(row),
+            "account": _account_view(conn, row),
             "deposits": [dict(d) for d in deposits],
             "cages": [dict(c) for c in cages],
         }

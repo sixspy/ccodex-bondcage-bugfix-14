@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -35,6 +36,20 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    # WAL 让未提交持锁对并发连接正确互斥，是首选模式；若文件系统不支持
+    # 写 -shm/-wal（或库文件只读），回退 DELETE——BEGIN IMMEDIATE 在两种
+    # 模式下都以库级写锁串行化抢锁者，争用判据不受影响。可用 BONDCAGE_JOURNAL_MODE 强制。
+    forced = os.environ.get("BONDCAGE_JOURNAL_MODE", "").strip().upper()
+    try:
+        if forced:
+            conn.execute(f"PRAGMA journal_mode={forced}")
+        else:
+            mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                conn.execute("PRAGMA journal_mode=DELETE")
+    except sqlite3.OperationalError:
+        conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -112,9 +127,11 @@ CREATE TABLE IF NOT EXISTS forfeits(
   FOREIGN KEY(cage_id) REFERENCES cages(id)
 );
 CREATE TABLE IF NOT EXISTS cage_locks(
-  lock_key TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lock_key TEXT NOT NULL,
   holder TEXT NOT NULL,
-  acquired_at TEXT NOT NULL
+  acquired_at TEXT NOT NULL,
+  released_at TEXT
 );
 CREATE TABLE IF NOT EXISTS contention_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -159,7 +176,107 @@ CREATE TABLE IF NOT EXISTS deposit_ledger(
   created_at TEXT NOT NULL,
   actor TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS forfeit_fate(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  caliber TEXT NOT NULL,
+  rule TEXT NOT NULL,
+  status TEXT NOT NULL,
+  sealed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS forfeit_yaw_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cage_id INTEGER NOT NULL,
+  cage_code TEXT NOT NULL,
+  party_key TEXT NOT NULL,
+  attempt_amount REAL NOT NULL,
+  frozen_on_hand REAL NOT NULL,
+  needed_frozen REAL NOT NULL,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
+
+# 罚没双扣唯一口径（甲路径），当日封死，谢绝第三套口径
+FORFEIT_FATE_CALIBER = "甲"
+FORFEIT_FATE_RULE = (
+    "罚没名册入账则余额与冻结同事务同额扣减；"
+    "冻结未齐扣则该笔正式零改回滚，只留偏航记并拒写"
+)
+
+
+def seal_forfeit_fate(conn: sqlite3.Connection) -> None:
+    """双扣命运纪要落库锁口径：只封一次，封死不改。"""
+    sealed = conn.execute("SELECT COUNT(*) c FROM forfeit_fate").fetchone()["c"]
+    if sealed:
+        return
+    conn.execute(
+        """INSERT INTO forfeit_fate(caliber,rule,status,sealed_at)
+           VALUES (?,?,?,?)""",
+        (FORFEIT_FATE_CALIBER, FORFEIT_FATE_RULE, "封死", now_iso()),
+    )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已存在的本机文件库做增量建表，不丢既有数据。"""
+    have = {
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "forfeit_fate" not in have:
+        conn.execute(
+            """CREATE TABLE forfeit_fate(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               caliber TEXT NOT NULL,
+               rule TEXT NOT NULL,
+               status TEXT NOT NULL,
+               sealed_at TEXT NOT NULL)"""
+        )
+    if "forfeit_yaw_log" not in have:
+        conn.execute(
+            """CREATE TABLE forfeit_yaw_log(
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               cage_id INTEGER NOT NULL,
+               cage_code TEXT NOT NULL,
+               party_key TEXT NOT NULL,
+               attempt_amount REAL NOT NULL,
+               frozen_on_hand REAL NOT NULL,
+               needed_frozen REAL NOT NULL,
+               reason TEXT NOT NULL,
+               actor TEXT NOT NULL,
+               created_at TEXT NOT NULL)"""
+        )
+    if "cage_locks" in have:
+        info = conn.execute("PRAGMA table_info(cage_locks)").fetchall()
+        cols = {r["name"] for r in info}
+        pk_cols = [r["name"] for r in info if r["pk"]]
+        if "released_at" not in cols or pk_cols == ["lock_key"]:
+            # 旧表：lock_key 为主键且无 released_at，重建为可多代持锁历史
+            conn.execute("ALTER TABLE cage_locks RENAME TO cage_locks_old")
+            conn.execute(
+                """CREATE TABLE cage_locks(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   lock_key TEXT NOT NULL,
+                   holder TEXT NOT NULL,
+                   acquired_at TEXT NOT NULL,
+                   released_at TEXT)"""
+            )
+            conn.execute(
+                """CREATE INDEX idx_cage_locks_active
+                   ON cage_locks(lock_key) WHERE released_at IS NULL"""
+            )
+            conn.execute(
+                """INSERT INTO cage_locks(lock_key,holder,acquired_at,released_at)
+                   SELECT lock_key, holder, acquired_at, NULL FROM cage_locks_old"""
+            )
+            conn.execute("DROP TABLE cage_locks_old")
+    # 新库与重建库统一补活跃锁部分索引
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_cage_locks_active
+           ON cage_locks(lock_key) WHERE released_at IS NULL"""
+    )
 
 
 def write_audit(conn: sqlite3.Connection, actor: str, action: str, target: str, payload: dict) -> None:
@@ -167,6 +284,37 @@ def write_audit(conn: sqlite3.Connection, actor: str, action: str, target: str, 
         """INSERT INTO audit_trail(actor,action,target,payload,created_at)
            VALUES (?,?,?,?,?)""",
         (actor, action, target, json.dumps(payload, ensure_ascii=False), now_iso()),
+    )
+
+
+def write_forfeit_yaw(
+    conn: sqlite3.Connection,
+    *,
+    cage_id: int,
+    cage_code: str,
+    party_key: str,
+    attempt_amount: float,
+    frozen_on_hand: float,
+    needed_frozen: float,
+    reason: str,
+    actor: str,
+) -> None:
+    """罚没双扣偏航留痕：该笔正式零改，仅记偏航并拒写。"""
+    conn.execute(
+        """INSERT INTO forfeit_yaw_log(cage_id,cage_code,party_key,attempt_amount,
+           frozen_on_hand,needed_frozen,reason,actor,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            cage_id,
+            cage_code,
+            party_key,
+            float(attempt_amount),
+            float(frozen_on_hand),
+            float(needed_frozen),
+            reason,
+            actor,
+            now_iso(),
+        ),
     )
 
 
@@ -272,10 +420,12 @@ def seed_attest_samples(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         seed_users(conn)
         seed_bonds(conn)
         seed_cages(conn)
         seed_attest_samples(conn)
+        seal_forfeit_fate(conn)
         conn.commit()
 
 

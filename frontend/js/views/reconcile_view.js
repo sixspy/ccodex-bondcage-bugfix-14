@@ -17,12 +17,13 @@ export const reconcileViewTemplate = `
   </div>
   <div v-if="recon.summary" class="hint">
     合计 {{ recon.summary.total }} · 平衡 {{ recon.summary.balanced }} · 失衡 {{ recon.summary.unbalanced }}
+    <template v-if="recon.summary.frozen_drift !== undefined"> · 冻结漂移 {{ recon.summary.frozen_drift }}</template>
   </div>
   <table>
     <thead>
       <tr>
         <th>笼</th><th>代</th><th>状态</th><th>总额</th><th>可用</th>
-        <th>拨付</th><th>罚没</th><th>合计</th><th>平衡</th><th>缺口</th>
+        <th>拨付</th><th>罚没</th><th>合计</th><th>平衡</th><th>账户冻结</th><th>冻结合规</th><th>缺口</th>
       </tr>
     </thead>
     <tbody>
@@ -38,6 +39,12 @@ export const reconcileViewTemplate = `
         <td>
           <span class="badge" :class="i.balanced?'pass':'fail'">{{ i.balanced ? '是' : '否' }}</span>
         </td>
+        <td>{{ fmt(i.account_frozen) }}</td>
+        <td>
+          <span class="badge" :class="i.frozen_consistent?'pass':'fail'">
+            {{ i.frozen_consistent ? '相符' : '漂移' }}
+          </span>
+        </td>
         <td>{{ fmt(i.gap) }}</td>
       </tr>
     </tbody>
@@ -47,7 +54,10 @@ export const reconcileViewTemplate = `
     <div class="proof-box">{{ JSON.stringify(partyProof.proof, null, 2) }}
 账户冻结 {{ fmt(partyProof.account.frozen) }}
 活笼可用 {{ fmt(partyProof.live_cage_available) }}
-匹配 {{ partyProof.frozen_matches_live }}
+匹配
+<span class="badge" :class="partyProof.frozen_matches_live ? 'pass' : 'fail'">
+  {{ partyProof.frozen_matches_live ? '是（账实相符）' : '否（冻结漂移）' }}
+</span>
 拨付合计 {{ fmt(partyProof.released_total) }}
 罚没合计 {{ fmt(partyProof.forfeited_total) }}</div>
   </div>

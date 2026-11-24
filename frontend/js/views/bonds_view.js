@@ -46,7 +46,7 @@ export const bondsViewTemplate = `
       <h3>账户一览</h3>
       <table>
         <thead>
-          <tr><th>键</th><th>名称</th><th>余额</th><th>冻结</th><th>可用</th><th>状态</th></tr>
+          <tr><th>键</th><th>名称</th><th>余额</th><th>冻结</th><th>可用</th><th>活笼冻结</th><th>冻结合规</th><th>状态</th></tr>
         </thead>
         <tbody>
           <tr v-for="b in bonds" :key="b.id" @click="loadBondDetail(b.party_key)" style="cursor:pointer">
@@ -55,6 +55,12 @@ export const bondsViewTemplate = `
             <td>{{ fmt(b.balance) }}</td>
             <td>{{ fmt(b.frozen) }}</td>
             <td>{{ fmt(b.balance - b.frozen) }}</td>
+            <td>{{ fmt(b.live_cage_available) }}</td>
+            <td>
+              <span class="badge" :class="b.frozen_consistent ? 'pass' : 'fail'">
+                {{ b.frozen_consistent ? '账实相符' : '冻结漂移' }}
+              </span>
+            </td>
             <td><span class="badge frozen">{{ b.status }}</span></td>
           </tr>
         </tbody>

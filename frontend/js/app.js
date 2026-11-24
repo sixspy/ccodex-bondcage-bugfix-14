@@ -48,6 +48,8 @@ createApp({
     const selectedCage = ref(null);
     const topupJobs = ref([]);
     const splitJobs = ref([]);
+    const forfeitFate = ref(null);
+    const forfeitYaw = ref([]);
 
     const bondForm = ref({
       party_key: "P-NEW",
@@ -195,6 +197,8 @@ createApp({
           lk,
           tj,
           sj,
+          fate,
+          yaw,
         ] = await Promise.all([
           api.bonds(),
           api.cages(),
@@ -207,6 +211,8 @@ createApp({
           api.locks(),
           api.topupJobs(),
           api.splitJobs(),
+          api.forfeitFate(),
+          api.forfeitYaw(),
         ]);
         bonds.value = b.items || [];
         cages.value = c.items || [];
@@ -219,6 +225,8 @@ createApp({
         locks.value = lk.items || [];
         topupJobs.value = tj.items || [];
         splitJobs.value = sj.items || [];
+        forfeitFate.value = fate || null;
+        forfeitYaw.value = yaw.items || [];
         if (!attestForm.value.cage_id && frozenCages.value.length) {
           attestForm.value.cage_id = frozenCages.value[0].id;
         }
@@ -417,6 +425,8 @@ createApp({
       selectedCage,
       topupJobs,
       splitJobs,
+      forfeitFate,
+      forfeitYaw,
       bondForm,
       depositForm,
       freezeForm,

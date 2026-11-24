@@ -37,6 +37,8 @@ def _reconcile_cage(conn, cage) -> dict:
            WHERE party_key=? AND status IN ('已冻结','核验通过','核验违约','部分解笼','部分罚没')""",
         (party,),
     ).fetchone()["s"]
+    account_frozen = float(acct["frozen"]) if acct else 0.0
+    frozen_consistent = abs(account_frozen - float(live_frozen)) < 1e-6
     return {
         "cage_id": cage_id,
         "cage_code": cage["cage_code"],
@@ -54,6 +56,7 @@ def _reconcile_cage(conn, cage) -> dict:
         "account_balance": float(acct["balance"]) if acct else None,
         "account_frozen": float(acct["frozen"]) if acct else None,
         "live_cage_available": float(live_frozen),
+        "frozen_consistent": frozen_consistent,
         "proof": {
             "formula": "available + released + forfeited == amount（同笼代）",
             "left": accounted,
@@ -69,12 +72,14 @@ def reconcile_all(authorization: AuthHeader = None):
         cages = conn.execute("SELECT * FROM cages ORDER BY id").fetchall()
         items = [_reconcile_cage(conn, c) for c in cages]
         bad = [i for i in items if not i["balanced"]]
+        frozen_drift = [i for i in items if not i["frozen_consistent"]]
         return {
             "items": items,
             "summary": {
                 "total": len(items),
                 "balanced": len(items) - len(bad),
                 "unbalanced": len(bad),
+                "frozen_drift": len(frozen_drift),
             },
         }
 
@@ -127,10 +132,34 @@ def party_proof(party_key: str, authorization: AuthHeader = None):
             "live_cage_available": live_f,
             "released_total": float(released),
             "forfeited_total": float(forfeited),
-            "frozen_matches_live": True,  # BUGFIX-14 埋雷：罚没漏扣冻结仍绿
+            "frozen_matches_live": abs(frozen - live_f) < 1e-6,
             "proof": {
                 "formula": "account.frozen == sum(live cage available)",
                 "left": frozen,
                 "right": live_f,
             },
         }
+
+
+@router.get("/api/forfeit-fate")
+def forfeit_fate(authorization: AuthHeader = None):
+    """罚没双扣命运纪要：口径当日封死，只可读。"""
+    require_user(authorization)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM forfeit_fate ORDER BY id LIMIT 1"
+        ).fetchall()
+        if not rows:
+            raise HTTPException(404, "双扣命运纪要尚未封档")
+        return dict(rows[0])
+
+
+@router.get("/api/forfeit-yaw")
+def forfeit_yaw(authorization: AuthHeader = None):
+    """罚没双扣偏航记：正式零改拒写的每次尝试都在此留痕。"""
+    require_user(authorization)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM forfeit_yaw_log ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        return {"items": [dict(r) for r in rows]}

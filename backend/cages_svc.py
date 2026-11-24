@@ -103,10 +103,16 @@ def freeze_cage(body: CageFreezeIn, authorization: AuthHeader = None):
                 ),
             )
             cage_id = cur.lastrowid
-            conn.execute(
-                "UPDATE bond_accounts SET frozen = frozen + ? WHERE party_key=?",
-                (amount, body.party_key),
+            # 原子条件更新：余额须始终覆盖冻结，杜绝入笼把账户写成冻结倒挂
+            upd = conn.execute(
+                """UPDATE bond_accounts
+                   SET frozen = frozen + ?
+                   WHERE party_key=? AND balance + 1e-9 >= frozen + ?""",
+                (amount, body.party_key, amount),
             )
+            if upd.rowcount != 1:
+                conn.rollback()
+                raise HTTPException(409, "可用保证金不足，入笼冻结未达成，整笔回滚")
             write_audit(
                 conn,
                 user,
